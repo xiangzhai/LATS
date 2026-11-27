@@ -154,6 +154,13 @@ void latx_do_mmio_tb_retranslate(void *ptr, int type)
 
 QemuSpin mmio_tb_waiting_lock;
 QTree *mmio_tb_waiting_tree;
+/*
+ * Lock-free depth of mmio_tb_waiting_tree.  The translation hot path only
+ * takes mmio_tb_waiting_lock when a TB is actually waiting for MMIO
+ * retranslation.  A missed increment just causes one more MMIO detection
+ * round, never a lost optimization.
+ */
+static unsigned mmio_tb_waiting_count;
 
 typedef struct {
     uint64_t pc;
@@ -176,16 +183,11 @@ int mmio_tb_data_index;
 /* call with mmio_tb_waiting_lock */
 static int mmio_tb_alloc(void)
 {
-    int i = 0;
-    mmio_tb_data_index += 1;
-    for (i = mmio_tb_data_index; i < MMIOTBDATAMAX; ++i) {
-        if (mmio_tb_val_data[i].index == -1) {
-            mmio_tb_val_data[i].index = i;
-            mmio_tb_data_index = i;
-            return i;
-        }
-    }
-    for (i = 0; i < mmio_tb_data_index; ++i) {
+    int start = (mmio_tb_data_index + 1) % MMIOTBDATAMAX;
+
+    for (int n = 0; n < MMIOTBDATAMAX; n++) {
+        int i = (start + n) % MMIOTBDATAMAX;
+
         if (mmio_tb_val_data[i].index == -1) {
             mmio_tb_val_data[i].index = i;
             mmio_tb_data_index = i;
@@ -206,20 +208,23 @@ static gint mmio_tb_cmp(gconstpointer ap, gconstpointer bp)
     const mmio_tb_key_t *a = ap;
     const mmio_tb_key_t *b = bp;
 
-    if (a->pc        == b->pc &&
-        a->flags     == b->flags &&
-        a->cflags    == b->cflags &&
-        a->cs_base   == b->cs_base &&
-        a->page_addr == b->page_addr) {
-        return 0;
-    }
-
-    if (a->pc > b->pc) return  1;
+    /*
+     * GTree requires a strict weak ordering.  Compare every key field in a
+     * deterministic order; returning a non-zero value for both (a, b) and
+     * (b, a) corrupts lookups when two TBs share pc but differ in flags,
+     * cflags or cs_base.
+     */
     if (a->pc < b->pc) return -1;
-    if (a->page_addr > b->page_addr) return  1;
+    if (a->pc > b->pc) return 1;
     if (a->page_addr < b->page_addr) return -1;
-
-    return 1;
+    if (a->page_addr > b->page_addr) return 1;
+    if (a->flags < b->flags) return -1;
+    if (a->flags > b->flags) return 1;
+    if (a->cs_base < b->cs_base) return -1;
+    if (a->cs_base > b->cs_base) return 1;
+    if (a->cflags < b->cflags) return -1;
+    if (a->cflags > b->cflags) return 1;
+    return 0;
 }
 
 static void __attribute__((constructor)) mmio_tb_init(void)
@@ -254,6 +259,7 @@ static bool mmio_tb_insert_waiting(TranslationBlock *tb)
 
     int id = mmio_tb_alloc();
     if (id < 0) {
+        qemu_spin_unlock(&mmio_tb_waiting_lock);
         return false;
     }
 
@@ -274,6 +280,7 @@ static bool mmio_tb_insert_waiting(TranslationBlock *tb)
 #endif
 
     q_tree_insert(mmio_tb_waiting_tree, k, v);
+    qatomic_inc(&mmio_tb_waiting_count);
 
     qemu_spin_unlock(&mmio_tb_waiting_lock);
     return true;
@@ -281,6 +288,11 @@ static bool mmio_tb_insert_waiting(TranslationBlock *tb)
 
 void latx_mmio_tb_check(TranslationBlock *tb)
 {
+    if (!option_opt_mmio ||
+        likely(!qatomic_read(&mmio_tb_waiting_count))) {
+        return;
+    }
+
     qemu_spin_lock(&mmio_tb_waiting_lock);
 
     mmio_tb_key_t k;
@@ -306,6 +318,7 @@ void latx_mmio_tb_check(TranslationBlock *tb)
 
     q_tree_remove(mmio_tb_waiting_tree, &k);
     mmio_tb_free(v->index);
+    qatomic_dec(&mmio_tb_waiting_count);
 
 unlock_out:
     qemu_spin_unlock(&mmio_tb_waiting_lock);
