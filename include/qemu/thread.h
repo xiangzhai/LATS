@@ -424,6 +424,7 @@ static inline unsigned long qemu_cond_wait_prepare_1(QemuCond *cond)
 void qemu_cond_wait_1(QemuCond *cond, QemuMutex *mutex);
 /* Reuse the same prepared ticket for every bounded-poll retry. */
 bool qemu_cond_wait_1_n_unlocked(QemuCond *cond, unsigned long ticket, int n);
+void qemu_cond_timedwait_1(QemuCond *cond, QemuMutex *mutex, int ms);
 void qemu_cond_broadcast_1(QemuCond *cond);
 void qemu_cond_signal_1(QemuCond *cond);
 void qemu_mutex_lock_1(QemuMutex *mutex);
@@ -439,6 +440,7 @@ void qemu_cond_signal_3(QemuCond *cond);
 #define qemu_mutex_lock_1(m) qemu_mutex_lock(m)
 #define qemu_mutex_unlock_1(m) qemu_mutex_unlock(m)
 #define qemu_cond_wait_1(c, m) qemu_cond_wait(c, m)
+#define qemu_cond_timedwait_1(c, m, ms) qemu_cond_timedwait(c, m, ms)
 #define qemu_cond_signal_1(c) qemu_cond_signal(c)
 #define qemu_cond_broadcast_1(c) qemu_cond_broadcast(c)
 #define qemu_cond_wait_2(c, m) qemu_cond_wait(c, m)

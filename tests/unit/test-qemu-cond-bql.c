@@ -276,6 +276,70 @@ static void test_kick_before_registration(void)
     qemu_mutex_destroy(&mutex);
 }
 
+static void test_timedwait_timeout(void)
+{
+    QemuMutex mutex;
+    QemuCond cond;
+    int64_t start, elapsed;
+
+    qemu_mutex_init(&mutex);
+    qemu_cond_init(&cond);
+    qemu_mutex_lock_1(&mutex);
+
+    start = g_get_monotonic_time();
+    qemu_cond_timedwait_1(&cond, &mutex, 20);
+    elapsed = g_get_monotonic_time() - start;
+
+    /* The timeout path must return with the predicate lock re-acquired. */
+    qemu_mutex_unlock_1(&mutex);
+    g_assert_cmpint(elapsed, >=, 10 * G_TIME_SPAN_MILLISECOND);
+    g_assert_cmpint(elapsed, <, G_TIME_SPAN_SECOND);
+
+    qemu_cond_destroy(&cond);
+    pthread_spin_destroy(&mutex.spin);
+    qemu_mutex_destroy(&mutex);
+}
+
+typedef struct TimedWaiter {
+    QemuCond *cond;
+} TimedWaiter;
+
+static void *timedwait_waker(void *opaque)
+{
+    TimedWaiter *waiter = opaque;
+
+    g_usleep(50 * G_TIME_SPAN_MILLISECOND);
+    qemu_cond_broadcast_3(waiter->cond);
+    return NULL;
+}
+
+static void test_timedwait_signal(void)
+{
+    QemuMutex mutex;
+    QemuCond cond;
+    TimedWaiter waiter = { .cond = &cond };
+    QemuThread thread;
+    int64_t start, elapsed;
+
+    qemu_mutex_init(&mutex);
+    qemu_cond_init(&cond);
+    qemu_thread_create(&thread, "timedwait-waker", timedwait_waker, &waiter,
+                       QEMU_THREAD_JOINABLE);
+
+    qemu_mutex_lock_1(&mutex);
+    start = g_get_monotonic_time();
+    qemu_cond_timedwait_1(&cond, &mutex, 5000);
+    elapsed = g_get_monotonic_time() - start;
+    qemu_mutex_unlock_1(&mutex);
+
+    qemu_thread_join(&thread);
+    g_assert_cmpint(elapsed, <, 4 * G_TIME_SPAN_SECOND);
+
+    qemu_cond_destroy(&cond);
+    pthread_spin_destroy(&mutex.spin);
+    qemu_mutex_destroy(&mutex);
+}
+
 static void *signal_race_waiter(void *opaque)
 {
     SignalWaiter *waiter = opaque;
@@ -390,6 +454,10 @@ int main(int argc, char **argv)
                     test_bounded_poll_ticket);
     g_test_add_func("/qemu-cond-bql/notify/kick-before-registration",
                     test_kick_before_registration);
+    g_test_add_func("/qemu-cond-bql/timedwait/timeout",
+                    test_timedwait_timeout);
+    g_test_add_func("/qemu-cond-bql/timedwait/signal",
+                    test_timedwait_signal);
     g_test_add_func("/qemu-cond-bql/wait3/signal-futex-queue-order",
                     test_signal_futex_queue_order);
     return g_test_run();

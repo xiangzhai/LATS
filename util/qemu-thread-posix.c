@@ -702,6 +702,8 @@ void *qemu_thread_join(QemuThread *thread)
 }
 
 #ifdef CONFIG_LATX_OPT_BQL
+#include "qemu/futex.h"
+
 /* Busy-wait tickets and futex wake generations are independent. */
 void qemu_cond_wait_1(QemuCond *cond, QemuMutex *mutex)
 {
@@ -729,6 +731,53 @@ bool qemu_cond_wait_1_n_unlocked(QemuCond *cond, unsigned long ticket, int n)
         count += 1;
     }
     return qatomic_read(&cond->release_seq) >= ticket;
+}
+
+/*
+ * Timed variant for the BQL.  The spinlock is released before waiting and
+ * re-acquired before returning, matching qemu_cond_wait_3.  A futex timeout
+ * uses CLOCK_MONOTONIC, so build an absolute deadline on that clock.
+ */
+void qemu_cond_timedwait_1(QemuCond *cond, QemuMutex *mutex, int ms)
+{
+    unsigned long ticket = qemu_cond_wait_prepare_1(cond);
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    ts.tv_sec += ms / 1000;
+    ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000L;
+    }
+
+    pthread_spin_unlock(&mutex->spin);
+    if (!qemu_cond_wait_1_n_unlocked(cond, ticket, 1024)) {
+        while (qatomic_read(&cond->release_seq) < ticket) {
+            unsigned int futex_seq = qatomic_read(&cond->futex_seq);
+            int ret;
+
+            if (!(qatomic_read(&cond->release_seq) < ticket)) {
+                break;
+            }
+            /*
+             * The LoongArch kernel used by LATS does not honor a timeout on
+             * plain FUTEX_WAIT; FUTEX_WAIT_BITSET with MATCH_ANY does.  A
+             * plain FUTEX_WAKE still wakes this waiter.
+             */
+            ret = qemu_futex(&cond->futex_seq, FUTEX_WAIT_BITSET,
+                             (int)futex_seq, &ts, NULL,
+                             FUTEX_BITSET_MATCH_ANY);
+            if (ret < 0 &&
+                (errno == ETIMEDOUT || errno == EWOULDBLOCK)) {
+                break;
+            }
+            if (ret < 0 && errno != EINTR) {
+                break;
+            }
+        }
+    }
+    pthread_spin_lock(&mutex->spin);
 }
 
 void qemu_cond_broadcast_1(QemuCond *cond)
@@ -768,7 +817,6 @@ void qemu_mutex_unlock_1(QemuMutex *mutex)
     pthread_spin_unlock(&mutex->spin);
 }
 
-#include "qemu/futex.h"
 void qemu_cond_wait_2(QemuCond *cond, QemuMutex *mutex)
 {
     unsigned int futex_seq = qatomic_read(&cond->futex_seq);

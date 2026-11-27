@@ -593,9 +593,7 @@ void qemu_cond_wait_2_iothread(QemuCond *cond)
 
 void qemu_cond_timedwait_iothread(QemuCond *cond, int ms)
 {
-		printf("%s \n", __func__);
-    pthread_spin_unlock(&qemu_global_mutex.spin);
-    qemu_cond_timedwait(cond, &qemu_global_mutex, ms);
+    qemu_cond_timedwait_1(cond, &qemu_global_mutex, ms);
 }
 
 /* signal CPU creation */
