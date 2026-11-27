@@ -354,6 +354,61 @@ static void latxs_tr_gen_string_loop_end(IR1_INST *pir1,
     }
 }
 
+/*
+ * Batched REP INS/OUTS.  The helper performs the whole transfer, taking the
+ * BQL once per chunk instead of once per element.  Guest memory is accessed
+ * outside the BQL so a page fault can restart the chunk without leaving the
+ * lock held.  The icount/split-string path keeps using the generated loop
+ * because it must stop at every element.
+ */
+static void latxs_tr_gen_rep_io(IR1_INST *pir1, IR1_OPND *port_opnd,
+                                int data_size, bool is_ins)
+{
+    TRANSLATION_DATA *td = lsenv->tr_data;
+    int addr_size = latxs_ir1_addr_size(pir1);
+    int addr_code = (addr_size == 16) ? 0 : (addr_size == 32 ? 1 : 2);
+    int size_code = (data_size == 8) ? 0 : (data_size == 16 ? 1 : 2);
+    bool is_rep = latxs_ir1_has_prefix_rep(pir1) ||
+                  latxs_ir1_has_prefix_repne(pir1);
+    int seg;
+    uint32_t info;
+
+    if (is_ins) {
+        seg = R_ES;
+    } else {
+        IR1_OPND *mem = ir1_get_opnd(pir1, 1);
+        seg = ir1_opnd_has_seg(mem) ? ir1_opnd_get_seg_index(mem) : R_DS;
+    }
+
+    info = size_code | (addr_code << 3) | ((uint32_t)is_rep << 5) |
+           (((uint32_t)td->sys.mem_index & 0xf) << 8) |
+           ((uint32_t)seg << 12);
+
+    latxs_tr_gen_call_to_helper_prologue_cfg(default_helper_cfg);
+
+    latxs_append_ir2_opnd2_(lisa_mov, &latxs_arg0_ir2_opnd,
+                            &latxs_env_ir2_opnd);
+    if (hamt_enabled()) {
+        latxs_tr_dmw_out_fix_mem(&latxs_arg0_ir2_opnd);
+    }
+
+    if (ir1_opnd_is_imm(port_opnd)) {
+        uint32_t p = ir1_opnd_uimm(port_opnd) &
+                     (data_size == 8 ? 0xff : 0xffff);
+        latxs_load_imm32_to_ir2(&latxs_arg1_ir2_opnd, p, EXMode_Z);
+    } else {
+        IR2_OPND port_reg = latxs_ra_alloc_gpr(ir1_opnd_base_reg_num(port_opnd));
+        latxs_append_ir2_opnd2_(lisa_mov16z, &latxs_arg1_ir2_opnd, &port_reg);
+    }
+
+    latxs_load_imm32_to_ir2(&latxs_arg2_ir2_opnd, info, EXMode_Z);
+
+    latxs_tr_gen_call_to_helper(is_ins ? (ADDR)helper_rep_ins
+                                       : (ADDR)helper_rep_outs,
+                                is_ins ? HELPER_REP_INS : HELPER_REP_OUTS);
+    latxs_tr_gen_call_to_helper_epilogue_cfg(default_helper_cfg);
+}
+
 bool latxs_translate_ins(IR1_INST *pir1)
 {
 #ifdef CONFIG_SOFTMMU
@@ -367,6 +422,12 @@ bool latxs_translate_ins(IR1_INST *pir1)
 
     /* Always check IO before any IO operation */
     latxs_tr_gen_io_check(pir1, opnd1, data_size);
+
+    if (!check_icount_mode()) {
+        latxs_tr_gen_rep_io(pir1, opnd1, data_size, true);
+        latxs_tr_gen_io_bpt(pir1, opnd1, data_size >> 3);
+        return true;
+    }
 
     /* 1. loop starts */
     IR2_OPND label_loop = latxs_ir2_opnd_new_inv();
@@ -479,6 +540,12 @@ bool latxs_translate_outs(IR1_INST *pir1)
     /* Always check IO before any IO operation */
     latxs_tr_gen_io_check(pir1, opnd0, data_size);
 
+    if (!check_icount_mode()) {
+        latxs_tr_gen_rep_io(pir1, opnd0, data_size, false);
+        latxs_tr_gen_io_bpt(pir1, opnd0, data_size >> 3);
+        return true;
+    }
+
     /* 1. loop starts */
     IR2_OPND label_loop = latxs_ir2_opnd_new_inv();
     IR2_OPND label_exit = latxs_ir2_opnd_new_inv();
@@ -553,7 +620,7 @@ bool latxs_translate_outs(IR1_INST *pir1)
     }
 
     /* 5. breakpoint IO */
-    latxs_tr_gen_io_bpt(pir1, opnd1, data_size >> 3);
+    latxs_tr_gen_io_bpt(pir1, opnd0, data_size >> 3);
 
     /* 6. loop ends */
     latxs_tr_gen_string_loop_end(pir1, label_loop, label_exit, NULL);

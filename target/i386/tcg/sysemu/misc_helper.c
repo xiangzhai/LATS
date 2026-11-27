@@ -66,6 +66,243 @@ target_ulong helper_inl(CPUX86State *env, uint32_t port)
                              cpu_get_mem_attrs(env), NULL);
 }
 
+/*
+ * Batched REP INS/OUTS.
+ *
+ * The old translation emitted a loop that called helper_inb/outb (and the
+ * softmmu accessors) once per element.  Every port access took the BQL, so a
+ * 512-byte PIO sector cost hundreds of lock/unlock pairs.  Process a chunk at
+ * a time instead: guest memory is accessed outside the BQL, and the port
+ * accesses of a chunk are performed under one BQL acquisition.
+ *
+ * info layout:
+ *   bits 0-1  size code (0=1, 1=2, 2=4 bytes)
+ *   bits 3-4  address size (0=16, 1=32, 2=64 bits)
+ *   bit  5    REP prefix present
+ *   bits 8-11 mmu index
+ *   bits 12-14 segment index
+ */
+#define LATX_REP_IO_CHUNK 256
+
+static inline uint32_t latx_rep_port_read(CPUX86State *env, uint32_t port,
+                                          int size_code)
+{
+    switch (size_code) {
+    case 0:
+        return address_space_ldub(&address_space_io, port,
+                                  cpu_get_mem_attrs(env), NULL);
+    case 1:
+        return address_space_lduw(&address_space_io, port,
+                                  cpu_get_mem_attrs(env), NULL);
+    default:
+        return address_space_ldl(&address_space_io, port,
+                                 cpu_get_mem_attrs(env), NULL);
+    }
+}
+
+static inline void latx_rep_port_write(CPUX86State *env, uint32_t port,
+                                       int size_code, uint32_t val)
+{
+    switch (size_code) {
+    case 0:
+        address_space_stb(&address_space_io, port, val,
+                          cpu_get_mem_attrs(env), NULL);
+        break;
+    case 1:
+        address_space_stw(&address_space_io, port, val,
+                          cpu_get_mem_attrs(env), NULL);
+        break;
+    default:
+        address_space_stl(&address_space_io, port, val,
+                          cpu_get_mem_attrs(env), NULL);
+        break;
+    }
+}
+
+static inline uint32_t latx_rep_guest_load(CPUX86State *env, uint64_t addr,
+                                           int size_code, int mmu_idx,
+                                           uintptr_t ra)
+{
+    switch (size_code) {
+    case 0:
+        return cpu_ldub_mmuidx_ra(env, addr, mmu_idx, ra);
+    case 1:
+        return cpu_lduw_mmuidx_ra(env, addr, mmu_idx, ra);
+    default:
+        return cpu_ldl_mmuidx_ra(env, addr, mmu_idx, ra);
+    }
+}
+
+static inline void latx_rep_guest_store(CPUX86State *env, uint64_t addr,
+                                        uint32_t val, int size_code,
+                                        int mmu_idx, uintptr_t ra)
+{
+    switch (size_code) {
+    case 0:
+        cpu_stb_mmuidx_ra(env, addr, val, mmu_idx, ra);
+        break;
+    case 1:
+        cpu_stw_mmuidx_ra(env, addr, val, mmu_idx, ra);
+        break;
+    default:
+        cpu_stl_mmuidx_ra(env, addr, val, mmu_idx, ra);
+        break;
+    }
+}
+
+static inline uint64_t latx_rep_get_reg(CPUX86State *env, int reg,
+                                        int addr_code)
+{
+    uint64_t v = env->regs[reg];
+
+    if (addr_code == 0) {
+        return (uint16_t)v;
+    }
+    if (addr_code == 1) {
+        return (uint32_t)v;
+    }
+    return v;
+}
+
+static inline void latx_rep_set_reg(CPUX86State *env, int reg, int addr_code,
+                                    uint64_t v)
+{
+    if (addr_code == 0) {
+        env->regs[reg] = (env->regs[reg] & ~0xffffULL) | (v & 0xffff);
+    } else if (addr_code == 1) {
+        env->regs[reg] = (uint32_t)v;
+    } else {
+        env->regs[reg] = v;
+    }
+}
+
+static inline uint64_t latx_rep_advance(uint64_t v, int step, int addr_code)
+{
+    v += step;
+
+    if (addr_code == 0) {
+        return v & 0xffff;
+    }
+    if (addr_code == 1) {
+        return v & 0xffffffff;
+    }
+    return v;
+}
+
+static void latx_rep_io(CPUX86State *env, uint32_t port, uint32_t info,
+                        bool is_ins)
+{
+    int size_code = info & 3;
+    int addr_code = (info >> 3) & 3;
+    bool is_rep = (info >> 5) & 1;
+    int mmu_idx = (info >> 8) & 0xf;
+    int seg = (info >> 12) & 7;
+    int size = 1 << size_code;
+    int step = env->df * size;
+    uint64_t count = is_rep ?
+        latx_rep_get_reg(env, R_ECX, addr_code) : 1;
+    uint64_t done = 0;
+    uint64_t idx = latx_rep_get_reg(env, is_ins ? R_EDI : R_ESI, addr_code);
+    uint64_t seg_base = env->segs[seg].base;
+    uint8_t buf[LATX_REP_IO_CHUNK * 4];
+    uintptr_t ra = GETPC();
+    X86CPU *cpu = env_archcpu(env);
+    uint32_t old_can_do_io = cpu->parent_obj.can_do_io;
+    int reg = is_ins ? R_EDI : R_ESI;
+
+    port &= 0xffff;
+
+    while (done < count) {
+        uint64_t left = count - done;
+        uint32_t n = left > LATX_REP_IO_CHUNK ? LATX_REP_IO_CHUNK : left;
+        uint64_t chunk_idx = idx;
+
+        if (is_ins) {
+            /*
+             * Fault the destination in before consuming I/O data so a page
+             * fault restarts the whole chunk without losing port input.
+             */
+            for (uint32_t i = 0; i < n; i++) {
+                latx_rep_guest_store(env, seg_base + chunk_idx, 0,
+                                     size_code, mmu_idx, ra);
+                chunk_idx = latx_rep_advance(chunk_idx, step, addr_code);
+            }
+
+            bool took_bql = !qemu_mutex_iothread_locked();
+
+            if (took_bql) {
+                qemu_mutex_lock_iothread();
+            }
+            cpu->parent_obj.can_do_io = 1;
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t v = latx_rep_port_read(env, port, size_code);
+                memcpy(buf + i * size, &v, size);
+            }
+            cpu->parent_obj.can_do_io = old_can_do_io;
+            if (took_bql) {
+                qemu_mutex_unlock_iothread();
+            }
+
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t v = 0;
+
+                memcpy(&v, buf + i * size, size);
+                latx_rep_guest_store(env, seg_base + idx, v,
+                                     size_code, mmu_idx, ra);
+                idx = latx_rep_advance(idx, step, addr_code);
+                if (is_rep) {
+                    latx_rep_set_reg(env, R_ECX, addr_code,
+                                     count - done - i - 1);
+                }
+                latx_rep_set_reg(env, reg, addr_code, idx);
+            }
+        } else {
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t v = latx_rep_guest_load(env, seg_base + chunk_idx,
+                                                 size_code, mmu_idx, ra);
+
+                memcpy(buf + i * size, &v, size);
+                chunk_idx = latx_rep_advance(chunk_idx, step, addr_code);
+            }
+
+            bool took_bql = !qemu_mutex_iothread_locked();
+
+            if (took_bql) {
+                qemu_mutex_lock_iothread();
+            }
+            cpu->parent_obj.can_do_io = 1;
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t v = 0;
+
+                memcpy(&v, buf + i * size, size);
+                latx_rep_port_write(env, port, size_code, v);
+                idx = latx_rep_advance(idx, step, addr_code);
+                if (is_rep) {
+                    latx_rep_set_reg(env, R_ECX, addr_code,
+                                     count - done - i - 1);
+                }
+                latx_rep_set_reg(env, reg, addr_code, idx);
+            }
+            cpu->parent_obj.can_do_io = old_can_do_io;
+            if (took_bql) {
+                qemu_mutex_unlock_iothread();
+            }
+        }
+
+        done += n;
+    }
+}
+
+void helper_rep_ins(CPUX86State *env, uint32_t port, uint32_t info)
+{
+    latx_rep_io(env, port, info, true);
+}
+
+void helper_rep_outs(CPUX86State *env, uint32_t port, uint32_t info)
+{
+    latx_rep_io(env, port, info, false);
+}
+
 target_ulong helper_read_crN(CPUX86State *env, int reg)
 {
     target_ulong val;

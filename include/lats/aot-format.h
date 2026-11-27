@@ -12,7 +12,7 @@
 #define AOT_TU   0x04
 #define AOT_TU_FLAG_BIT 10
 
-#define AOT_FORMAT_VERSION "-format36"
+#define AOT_FORMAT_VERSION "-format37"
 
 #define AOT_PAGE_MAGIC 0x66666666
 #define AOT_MERGED_MAGIC 0x77777777
@@ -403,6 +403,8 @@ typedef enum aot_rel_kind {
     HELPER_FISTT_ST0,
     HELPER_FISTTL_ST0,
     HELPER_FISTTLL_ST0,
+    HELPER_REP_INS,
+    HELPER_REP_OUTS,
     LATX_APIC_MEM_WRITE,
 
     LATXS_CONVERT_FPREGS_64_TO_X80,
@@ -593,7 +595,7 @@ static inline bool aot_page_info_size(uint32_t page_count, size_t *size)
 LATS_AOT_STATIC_ASSERT(sizeof(uintptr_t) == 8, "AOT requires a 64-bit host");
 LATS_AOT_STATIC_ASSERT(sizeof(aot_rel) == 32, "AOT relocation layout");
 LATS_AOT_STATIC_ASSERT(sizeof(aot_tu_head) == 40, "AOT TU layout");
-LATS_AOT_STATIC_ASSERT(sizeof(aot_tail) == 2056, "AOT tail layout");
+LATS_AOT_STATIC_ASSERT(sizeof(aot_tail) == 2072, "AOT tail layout");
 #if defined(CONFIG_LATX_TU) || defined(LATS_AOT_DISK_TU)
 LATS_AOT_STATIC_ASSERT(sizeof(aot_block) == 176, "AOT member layout");
 #endif
